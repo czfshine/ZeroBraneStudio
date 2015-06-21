@@ -1,4 +1,4 @@
--- Copyright 2011-14 Paul Kulchenko, ZeroBrane LLC
+-- Copyright 2011-15 Paul Kulchenko, ZeroBrane LLC
 -- authors: Luxinia Dev (Eike Decker & Christoph Kubisch)
 ---------------------------------------------------------
 
@@ -189,7 +189,7 @@ end
 local function generateAPIInfo(only)
   for i,api in pairs(apis) do
     if ((not only) or i == only) then
-      fillTips(api,"",i)
+      fillTips(api,"")
     end
   end
 end
@@ -226,8 +226,19 @@ local function resolveAssign(editor,tx)
   local c
   if (assigns) then
     -- find assign
-    local change = true
+    local change, n, stopat = true, 0, os.clock() + 0.2
     while (change) do
+      -- abort the check if the auto-complete is taking too long
+      if n > 50 and os.clock() > stopat then
+        if ide.config.acandtip.warning then
+          DisplayOutputLn("Warning: Auto-complete was aborted after taking too long to complete."
+            .. " Please report this warning along with the text you were typing to support@zerobrane.com.")
+        end
+        break
+      else
+        n = n + 1
+      end
+
       local classname = nil
       c = ""
       change = false
@@ -245,6 +256,8 @@ local function resolveAssign(editor,tx)
         end
       end
       tx = c
+      -- if there is any class duplication, abort the loop
+      if classname and select(2, c:gsub(classname, classname)) > 1 then break end
     end
   else
     c = tx
@@ -605,27 +618,24 @@ function CreateAutoCompList(editor,key,pos)
       local strategy = ide.config.acandtip.strategy
 
       if (strategy == 2 and #apilist < 128) then
-        local pat = rest:gsub(".",function(c)
-            local l = c:lower()..c:upper()
-            return "["..l.."]([^"..l.." ]*)"
-          end)
-
-        local g = string.gsub
+        -- when matching "ret": "ret." < "re.t" < "r.et"
+        local pat = rest:gsub(".", function(c) return "["..c:lower()..c:upper().."](.-)" end)
+        local weights = {}
+        local penalty = 0.1
+        local function weight(str)
+          if not weights[str] then
+            local w = 0
+            str:gsub(pat,function(...)
+                local l = {...}
+                -- penalize gaps between matches, more so at the beginning
+                for n, v in ipairs(l) do w = w + #v * (1 + (#l-n)*penalty) end
+              end)
+            weights[str] = w
+          end
+          return weights[str]
+        end
         table.sort(apilist,function(a,b)
-            local ma,mb = 0,0
-            g(a,pat,function(...)
-                local l = {...}
-                for _, v in ipairs(l) do
-                  ma = ma + ((v=="") and 0 or 1)
-                end
-              end)
-            g(b,pat,function(...)
-                local l = {...}
-                for _, v in ipairs(l) do
-                  mb = mb + ((v=="") and 0 or 1)
-                end
-              end)
-
+            local ma, mb = weight(a), weight(b)
             if (ma == mb) then return a:lower()<b:lower() end
             return ma<mb
           end)

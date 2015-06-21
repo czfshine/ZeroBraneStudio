@@ -93,7 +93,7 @@ function LoadFile(filePath, editor, file_must_exist, skipselection)
   -- skip binary files with unknown extensions as they may have any sequences;
   -- can't show them anyway.
   if file_text and #file_text > 0 and #(editor:GetText()) == 0
-  and (editor.spec ~= ide.specs.none or not isBinary(file_text)) then
+  and (editor.spec ~= ide.specs.none or not IsBinary(file_text)) then
     local replacement, invalid = "\022"
     file_text, invalid = FixUTF8(file_text, replacement)
     if #invalid > 0 then
@@ -142,18 +142,19 @@ function LoadFile(filePath, editor, file_must_exist, skipselection)
   end
 
   editor:EmptyUndoBuffer()
-  local id = editor:GetId()
-  if openDocuments[id] then -- existing editor; switch to the tab
-    notebook:SetSelection(openDocuments[id].index)
+  local doc = ide:GetDocument(editor)
+  if doc then -- existing editor; switch to the tab
+    notebook:SetSelection(doc:GetTabIndex())
   else -- the editor has not been added to notebook
-    AddEditor(editor, wx.wxFileName(filePath):GetFullName()
+    doc = AddEditor(editor, wx.wxFileName(filePath):GetFullName()
       or ide.config.default.fullname)
   end
-  openDocuments[id].filePath = filePath
-  openDocuments[id].fileName = wx.wxFileName(filePath):GetFullName()
-  openDocuments[id].modTime = GetFileModTime(filePath)
+  doc.filePath = filePath
+  doc.fileName = wx.wxFileName(filePath):GetFullName()
+  doc.modTime = GetFileModTime(filePath)
 
-  SetDocumentModified(id, false, openDocuments[id].fileName)
+  doc:SetModified(false)
+  doc:SetTabText(doc:GetFileName())
 
   -- activate the editor; this is needed for those cases when the editor is
   -- created from some other element, for example, from a project tree.
@@ -278,11 +279,12 @@ function SaveFile(editor, filePath)
     local ok, err = FileWrite(filePath, st)
     if ok then
       editor:SetSavePoint()
-      local id = editor:GetId()
-      openDocuments[id].filePath = filePath
-      openDocuments[id].fileName = wx.wxFileName(filePath):GetFullName()
-      openDocuments[id].modTime = GetFileModTime(filePath)
-      SetDocumentModified(id, false, openDocuments[id].fileName)
+      local doc = ide:GetDocument(editor)
+      doc.filePath = filePath
+      doc.fileName = wx.wxFileName(filePath):GetFullName()
+      doc.modTime = GetFileModTime(filePath)
+      doc:SetModified(false)
+      doc:SetTabText(doc:GetFileName())
       SetAutoRecoveryMark()
       FileTreeMarkSelected(filePath)
 
@@ -428,6 +430,11 @@ end
 function ClosePage(selection)
   local editor = GetEditor(selection)
   local id = editor:GetId()
+
+  if PackageEventHandle("onEditorPreClose", editor) == false then
+    return false
+  end
+
   if SaveModifiedDialog(editor, true) ~= wx.wxID_CANCEL then
     DynamicWordsRemoveAll(editor)
     local debugger = ide.debugger
@@ -447,7 +454,9 @@ function ClosePage(selection)
 
     -- disable full screen if the last tab is closed
     if not (notebook:GetSelection() >= 0) then ShowFullScreen(false) end
+    return true
   end
+  return false
 end
 
 function CloseAllPagesExcept(selection)
@@ -503,60 +512,11 @@ function SaveOnExit(allow_cancel)
   -- if all documents have been saved or refused to save, then mark those that
   -- are still modified as not modified (they don't need to be saved)
   -- to keep their tab names correct
-  for id, document in pairs(openDocuments) do
-    if document.isModified then SetDocumentModified(id, false) end
+  for _, document in pairs(openDocuments) do
+    if document.isModified then document:SetModified(false) end
   end
 
   return true
-end
-
--- circle through "fold all" => "hide base lines" => "unfold all"
-function FoldSome()
-  local editor = GetEditor()
-  editor:Colourise(0, -1) -- update doc's folding info
-  local foldall = false -- at least on header unfolded => fold all
-  local hidebase = false -- at least one base is visible => hide all
-
-  for ln = 0, editor.LineCount - 1 do
-    local foldRaw = editor:GetFoldLevel(ln)
-    local foldLvl = foldRaw % 4096
-    local foldHdr = (math.floor(foldRaw / 8192) % 2) == 1
-
-    -- at least one header is expanded
-    foldall = foldall or (foldHdr and editor:GetFoldExpanded(ln))
-
-    -- at least one base can be hidden
-    hidebase = hidebase or (
-      not foldHdr
-      and ln > 1 -- first line can't be hidden, so ignore it
-      and foldLvl == wxstc.wxSTC_FOLDLEVELBASE
-      and bit.band(foldRaw, wxstc.wxSTC_FOLDLEVELWHITEFLAG) == 0
-      and editor:GetLineVisible(ln))
-  end
-
-  -- shows lines; this doesn't change fold status for folded lines
-  if not foldall and not hidebase then editor:ShowLines(0, editor.LineCount-1) end
-
-  for ln = 0, editor.LineCount-1 do
-    local foldRaw = editor:GetFoldLevel(ln)
-    local foldLvl = foldRaw % 4096
-    local foldHdr = (math.floor(foldRaw / 8192) % 2) == 1
-
-    if foldall then
-      if foldHdr and editor:GetFoldExpanded(ln) then
-        editor:ToggleFold(ln)
-      end
-    elseif hidebase then
-      if not foldHdr and (foldLvl == wxstc.wxSTC_FOLDLEVELBASE) then
-        editor:HideLines(ln, ln)
-      end
-    else -- unfold all
-      if foldHdr and not editor:GetFoldExpanded(ln) then
-        editor:ToggleFold(ln)
-      end
-    end
-  end
-  editor:EnsureCaretVisible()
 end
 
 function SetAllEditorsReadOnly(enable)
@@ -738,21 +698,21 @@ function SetOpenTabs(params)
     DisplayOutputLn(TR("Found auto-recovery record and restored saved session."))
   end
   for _,doc in ipairs(nametab) do
-    -- check for missing file is no content is stored
+    -- check for missing file if no content is stored
     if doc.filepath and not doc.content and not wx.wxFileExists(doc.filepath) then
       DisplayOutputLn(TR("File '%s' is missing and can't be recovered.")
         :format(doc.filepath))
     else
       local editor = (doc.filepath and LoadFile(doc.filepath,nil,true,true)
         or findUnusedEditor() or NewFile(doc.filename))
-      local opendoc = openDocuments[editor:GetId()]
+      local opendoc = ide:GetDocument(editor)
       if doc.content then
         editor:SetText(doc.content)
         if doc.filepath and opendoc.modTime and doc.modified < opendoc.modTime:GetTicks() then
           DisplayOutputLn(TR("File '%s' has more recent timestamp than restored '%s'; please review before saving.")
-            :format(doc.filepath, doc.tabname))
+            :format(doc.filepath, opendoc:GetTabText()))
         end
-        SetDocumentModified(editor:GetId(), true)
+        opendoc:SetModified(true)
       end
       editor:GotoPosDelayed(doc.cursorpos or 0)
     end
@@ -764,21 +724,23 @@ end
 local function getOpenTabs()
   local opendocs = {}
   for _, document in pairs(ide.openDocuments) do
+    local editor = document:GetEditor()
     table.insert(opendocs, {
-      filename = document.fileName,
-      filepath = document.filePath,
-      tabname = notebook:GetPageText(document.index),
-      modified = document.modTime and document.modTime:GetTicks(), -- get number of seconds
-      content = document.isModified and document.editor:GetText() or nil,
-      id = document.index, cursorpos = document.editor:GetCurrentPos()})
+      filename = document:GetFileName(),
+      filepath = document:GetFilePath(),
+      tabname = document:GetTabText(),
+      modified = document:GetModTime() and document:GetModTime():GetTicks(), -- get number of seconds
+      content = document:IsModified() and editor:GetText() or nil,
+      id = document:GetTabIndex(),
+      cursorpos = editor:GetCurrentPos()})
   end
 
   -- to keep tab order
   table.sort(opendocs, function(a,b) return (a.id < b.id) end)
 
-  local id = GetEditor()
-  id = id and id:GetId()
-  return opendocs, {index = (id and openDocuments[id].index or 0)}
+  local ed = GetEditor()
+  local doc = ed and ide:GetDocument(ed)
+  return opendocs, {index = (doc and doc:GetTabIndex() or 0)}
 end
 
 function SetAutoRecoveryMark()
@@ -965,7 +927,9 @@ ide.editorApp:Connect(wx.wxEVT_SET_FOCUS, function(event)
     local class = win:GetClassInfo():GetClassName()
     -- don't set focus on the main frame or toolbar
     if ide.infocus and (class == 'wxAuiToolBar' or class == 'wxFrame') then
-      pcall(function() ide.infocus:SetFocus() end)
+      -- check if the window is shown before returning focus to it,
+      -- as it may lead to a recursion in event handlers on OSX (wxwidgets 2.9.5).
+      pcall(function() if ide:IsWindowShown(ide.infocus) then ide.infocus:SetFocus() end end)
       return
     end
 
@@ -1009,14 +973,12 @@ ide.editorApp:Connect(wx.wxEVT_ACTIVATE_APP,
         -- restore focus to the last element that received it;
         -- wrap into pcall in case the element has disappeared
         -- while the application was out of focus
-        pcall(function() ide.infocus:SetFocus() end)
+        pcall(function() if ide:IsWindowShown(ide.infocus) then ide.infocus:SetFocus() end end)
       end
 
       local active = event:GetActive()
       -- save auto-recovery record when making the app inactive
       if not active then saveAutoRecovery(true) end
-      -- also collect all the garbage
-      if not active then collectgarbage() end
 
       -- disable UI refresh when app is inactive, but only when not running
       wx.wxUpdateUIEvent.SetUpdateInterval(
@@ -1044,3 +1006,18 @@ function PaneFloatToggle(window)
   end
   uimgr:Update()
 end
+
+frame:Connect(wx.wxEVT_IDLE,
+  function(event)
+    local debugger = ide.debugger
+    if (debugger.update) then debugger.update() end
+    if (debugger.scratchpad) then DebuggerRefreshScratchpad() end
+    if IndicateIfNeeded() then event:RequestMore(true) end
+    PackageEventHandleOnce("onIdleOnce", event)
+    PackageEventHandle("onIdle", event)
+
+    -- process onidle events if any
+    while #ide.onidle > 0 do table.remove(ide.onidle)() end
+
+    event:Skip() -- let other EVT_IDLE handlers to work on the event
+  end)
